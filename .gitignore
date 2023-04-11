@@ -1,0 +1,57 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Project-local glide cache, RE: https://github.com/Masterminds/glide/issues/736
+.glide/
+
+# Dependency directories
+vendor/
+
+# Build artifacts
+build/
+
+# macOS
+.DS_Store
+
+# Go cache files
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Go generated files
+*.go
+*.pb.go
+*.gw.go
+
+# IntelliJ
+*.iml
+*.ipr
+*.iws
+*.log
+
+# Popular Go web frameworks and dev tools
+/vendor/github.com/
+/vendor/golang.org/
+/vendor/gopkg.in/
+
+# Go Submodule directories
+.git/modules/
+
+# Ignore all log files and directories
+logs/
+*.log
