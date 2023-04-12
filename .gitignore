@@ -34,7 +34,6 @@ eggs/
 *.egg
 
 # Go generated files
-*.go
 *.pb.go
 *.gw.go
 
@@ -55,3 +54,6 @@ eggs/
 # Ignore all log files and directories
 logs/
 *.log
+
+.env
+

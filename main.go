@@ -1,18 +1,18 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math/rand"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -25,7 +25,7 @@ type DistanceRequest struct {
 var (
 	clientID     string
 	clientSecret string
-	redirectURI  = "linkedin-auth://callback"
+	redirectURI  string
 )
 
 func main() {
@@ -65,16 +65,20 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 
 func getRandomCompany() string {
 	companies := []string{"Company A", "Company B", "Company C", "Company D", "Company E"}
-	randSource := rand.NewSource(time.Now().UnixNano())
-	randGen := rand.New(randSource)
-	return companies[randGen.Intn(len(companies))]
+
+	nBig, err := rand.Int(rand.Reader, big.NewInt(int64(len(companies))))
+	if err != nil {
+		panic(err)
+	}
+	n := nBig.Int64()
+
+	return companies[n]
 }
 
 func linkedinAuthHandler(w http.ResponseWriter, r *http.Request) {
 	state := generateRandomString(16)
 	authorizationURL := fmt.Sprintf("https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=%s&redirect_uri=%s&state=%s&scope=r_liteprofile%%20r_emailaddress", clientID, url.QueryEscape(redirectURI), state)
 	http.Redirect(w, r, authorizationURL, http.StatusTemporaryRedirect)
-
 }
 
 func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
