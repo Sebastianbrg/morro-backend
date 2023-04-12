@@ -82,7 +82,6 @@ func linkedinAuthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Printf("Callback received with query: %s\n", r.URL.RawQuery)
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
 
@@ -92,7 +91,8 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Fprintf(w, "Access Token: %s", accessToken)
+	callbackURL := fmt.Sprintf("%s?access_token=%s", redirectURI, accessToken)
+	http.Redirect(w, r, callbackURL, http.StatusTemporaryRedirect)
 }
 
 func requestAccessToken(code, state string) (string, error) {
