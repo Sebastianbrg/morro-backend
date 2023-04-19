@@ -61,10 +61,10 @@ func main() {
 		log.Fatalf("Error creating companies table: %v", err)
 	}
 
-	err = generateSyntheticData(db) // Generate 5 companies, 50 users, and 200 rides
+	/* err = generateSyntheticData(db) // Generate 5 companies, 50 users, and 200 rides
 	if err != nil {
 		log.Fatalf("Error generating synthetic data: %v", err)
-	}
+	} */
 
 	data, err := getLeaderboard(db, 1)
 	fmt.Println(data)
