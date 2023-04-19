@@ -37,8 +37,11 @@ func initDB() {
 
 }
 
+var db *sql.DB
+
 func main() {
-	err := godotenv.Load()
+	var err error
+	err = godotenv.Load()
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
@@ -47,7 +50,7 @@ func main() {
 	clientSecret = os.Getenv("LINKEDIN_CLIENT_SECRET")
 	redirectURI = os.Getenv("LINKEDIN_REDIRECT_URI")
 
-	db, err := openConnection()
+	db, err = openConnection()
 	if err != nil {
 		log.Fatalf("Error opening database connection: %v", err)
 	}
@@ -243,13 +246,12 @@ func randomFloat64(min, max float64) float64 {
 	return f*(max-min) + min
 }
 
-func generateJWT(user User) (string, error) {
+func generateJWT(user *User) (string, error) {
 	// Create a new JWT token
 	token := jwt.New(jwt.SigningMethodHS256)
 
 	// Set the claims for the token
 	claims := token.Claims.(jwt.MapClaims)
-	claims["id"] = user.ID
 	claims["firstName"] = user.FirstName
 	claims["lastName"] = user.LastName
 	claims["exp"] = time.Now().Add(time.Hour * 24).Unix()
@@ -321,15 +323,24 @@ func linkedinAuthHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, authorizationURL, http.StatusTemporaryRedirect)
 }
 
-func findUserInDatabase(id int) User {
-	fmt.Println(id)
+func findUserInDatabase(id int) (*User, error) {
+	query := `SELECT id, first_name, last_name, company_id FROM users WHERE id = $1`
 
-	return User{FirstName: "Not implemented"}
+	user := &User{}
+	err := db.QueryRow(query, id).Scan(&user.ID, &user.FirstName, &user.LastName, &user.CompanyID)
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
 }
 
 func authenticateUser(user User) (string, error) {
 	// Retrieve the user from the database
-	dbUser := findUserInDatabase(user.ID)
+	dbUser, err := findUserInDatabase(user.ID)
+	if err != nil {
+		return "", err
+	}
 
 	// If the user exists in the database, generate a JWT token and return it
 	token, err := generateJWT(dbUser)
