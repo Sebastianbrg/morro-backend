@@ -43,6 +43,9 @@ var db *sql.DB
 var rdb *redis.Client
 var ctx = context.Background()
 
+// Sign the token using a secret key
+var jwtSecretKey = []byte(os.Getenv("JWT_SECRET"))
+
 func main() {
 	var err error
 	err = godotenv.Load()
@@ -83,7 +86,7 @@ func main() {
 	http.HandleFunc("/auth/linkedin/callback", linkedinCallbackHandler)
 	http.HandleFunc("/login", login)
 	http.Handle("/user/stats/", http.StripPrefix("/user/stats/", http.HandlerFunc(handleGetUserStats)))
-	http.Handle("/company/stats/", http.StripPrefix("/company/stats/", http.HandlerFunc(handleGetCompanyStats)))
+	http.Handle("/company/stats/", http.StripPrefix("/company/stats/", jwtAuthMiddleware(http.HandlerFunc(handleGetCompanyStats))))
 	http.HandleFunc("/company/leaderboard/", handleGetLeaderboard)
 
 	log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), nil))
@@ -105,6 +108,39 @@ type UserSession struct {
 	AppleRefreshToken      string
 	AppleExpiresIn         int64
 	AppleTokenCreatedAt    int64
+}
+
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+
+		if tokenString == "" {
+			http.Error(w, "Invalid authorization header", http.StatusUnauthorized)
+			return
+		}
+
+		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+			}
+			return jwtSecretKey, nil
+		})
+
+		if err != nil || !token.Valid {
+			http.Error(w, "Invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		claims, ok := token.Claims.(jwt.MapClaims)
+		if !ok || claims["userID"] == nil {
+			http.Error(w, "Invalid token claims", http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), "userID", claims["userID"])
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func storeUserSession(userSession *UserSession) error {
@@ -187,6 +223,7 @@ func getCompanyStats(companyID int) (CompanyStats, error) {
 }
 
 func handleGetCompanyStats(w http.ResponseWriter, r *http.Request) {
+	userID, _ := r.Context().Value("userID").(int)
 	companyIDStr := strings.TrimPrefix(r.URL.Path, "/company/stats/")
 
 	companyID, err := strconv.Atoi(companyIDStr)
@@ -194,6 +231,7 @@ func handleGetCompanyStats(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid company ID", http.StatusBadRequest)
 		return
 	}
+	fmt.Println("User ID from token: ", userID)
 
 	stats, err := getCompanyStats(companyID)
 	if err != nil {
@@ -396,6 +434,24 @@ func generateSyntheticData(db *sql.DB) error {
 	return nil
 }
 
+func storeUserIfNotExists(userInfo *LinkedInUserInfo) (int, error) {
+	query := `INSERT INTO users (first_name, last_name, email, linkedin_id)
+	          VALUES ($1, $2, $3, $4)
+			  ON CONFLICT (linkedin_id) DO UPDATE
+			  SET first_name = excluded.first_name,
+			      last_name = excluded.last_name,
+				  email = excluded.email
+			  RETURNING id`
+
+	var userID int
+	err := db.QueryRow(query, userInfo.FirstName.Localized.EnUS, userInfo.LastName.Localized.EnUS, userInfo.Email.EmailAddress, userInfo.ID).Scan(&userID)
+	if err != nil {
+		return 0, err
+	}
+
+	return userID, nil
+}
+
 func randomInt(min, max int) int {
 	bigIntMax := big.NewInt(int64(max - min))
 	nBig, err := rand.Int(rand.Reader, bigIntMax)
@@ -417,7 +473,21 @@ func randomFloat64(min, max float64) float64 {
 	return f*(max-min) + min
 }
 
-func generateJWT(user *User) (string, error) {
+func createJWTTokenSimple(userID int) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"userID": userID,
+		"exp":    time.Now().Add(24 * time.Hour).Unix(),
+	})
+
+	signedToken, err := token.SignedString(jwtSecretKey)
+	if err != nil {
+		return "", err
+	}
+
+	return signedToken, nil
+}
+
+func generateJWTMoreInformation(user *User) (string, error) {
 	// Create a new JWT token
 	token := jwt.New(jwt.SigningMethodHS256)
 
@@ -427,9 +497,7 @@ func generateJWT(user *User) (string, error) {
 	claims["lastName"] = user.LastName
 	claims["exp"] = time.Now().Add(time.Hour * 24).Unix()
 
-	// Sign the token using a secret key
-	secretKey := []byte("your_secret_key")
-	signedToken, err := token.SignedString(secretKey)
+	signedToken, err := token.SignedString(jwtSecretKey)
 	if err != nil {
 		return "", err
 	}
@@ -475,7 +543,7 @@ func authenticateUser(user User) (string, error) {
 	}
 
 	// If the user exists in the database, generate a JWT token and return it
-	token, err := generateJWT(dbUser)
+	token, err := generateJWTMoreInformation(dbUser)
 	if err != nil {
 		return "", err
 	}
