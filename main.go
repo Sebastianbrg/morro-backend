@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
+	"github.com/go-redis/redis/v8"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
@@ -38,6 +40,8 @@ func initDB() {
 }
 
 var db *sql.DB
+var rdb *redis.Client
+var ctx = context.Background()
 
 func main() {
 	var err error
@@ -55,6 +59,14 @@ func main() {
 		log.Fatalf("Error opening database connection: %v", err)
 	}
 	defer db.Close()
+
+	rdb = redis.NewClient(&redis.Options{
+		Addr:     os.Getenv("REDIS_HOST"),
+		Password: os.Getenv("REDIS_SECRET"), // no password set
+		DB:       0,                         // use default DB
+	})
+
+	// Other code, e.g., setting up HTTP routes
 
 	err = createTables(db)
 	if err != nil {
@@ -76,6 +88,44 @@ func main() {
 
 	log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), nil))
 
+}
+
+type UserSession struct {
+	UserID                 int // Database user ID
+	FirstName              string
+	LastName               string
+	Email                  string
+	LinkedInID             string
+	AppleID                string
+	LinkedInAccessToken    string
+	LinkedInRefreshToken   string
+	LinkedInExpiresIn      int64
+	LinkedInTokenCreatedAt int64
+	AppleAccessToken       string
+	AppleRefreshToken      string
+	AppleExpiresIn         int64
+	AppleTokenCreatedAt    int64
+}
+
+func storeUserSession(userSession *UserSession) error {
+	jsonData, err := json.Marshal(userSession)
+	if err != nil {
+		return err
+	}
+	return rdb.Set(ctx, fmt.Sprintf("user_session:%d", userSession.UserID), jsonData, 0).Err()
+}
+
+func getUserSession(userID int) (*UserSession, error) {
+	jsonData, err := rdb.Get(ctx, fmt.Sprintf("user_session:%d", userID)).Bytes()
+	if err != nil {
+		return nil, err
+	}
+	var userSession UserSession
+	err = json.Unmarshal(jsonData, &userSession)
+	if err != nil {
+		return nil, err
+	}
+	return &userSession, nil
 }
 
 func handleGetLeaderboard(w http.ResponseWriter, r *http.Request) {
@@ -461,6 +511,64 @@ func login(w http.ResponseWriter, r *http.Request) {
 
 }
 
+type LinkedInUserInfo struct {
+	ID        string `json:"id"`
+	FirstName struct {
+		Localized struct {
+			EnUS string `json:"en_US"`
+		} `json:"localized"`
+	} `json:"firstName"`
+	LastName struct {
+		Localized struct {
+			EnUS string `json:"en_US"`
+		} `json:"localized"`
+	} `json:"lastName"`
+	Email struct {
+		EmailAddress string `json:"emailAddress"`
+	} `json:"elements"`
+}
+
+func getLinkedInUserInfo(accessToken string) (*LinkedInUserInfo, error) {
+	client := &http.Client{}
+
+	// Request basic profile information
+	profileReq, _ := http.NewRequest("GET", "https://api.linkedin.com/v2/me?projection=(id,firstName,lastName)", nil)
+	profileReq.Header.Add("Authorization", "Bearer "+accessToken)
+	profileResp, err := client.Do(profileReq)
+	if err != nil {
+		return nil, err
+	}
+	defer profileResp.Body.Close()
+
+	profileData, err := ioutil.ReadAll(profileResp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Request email address
+	emailReq, _ := http.NewRequest("GET", "https://api.linkedin.com/v2/emailAddress?q=members&projection=(elements*(handle~))", nil)
+	emailReq.Header.Add("Authorization", "Bearer "+accessToken)
+	emailResp, err := client.Do(emailReq)
+	if err != nil {
+		return nil, err
+	}
+	defer emailResp.Body.Close()
+
+	emailData, err := ioutil.ReadAll(emailResp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Combine the profile and email data into a single JSON object
+	var userInfo LinkedInUserInfo
+	err = json.Unmarshal(append(profileData[:len(profileData)-1], []byte(`,"elements":`+string(emailData)+`}`)...), &userInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	return &userInfo, nil
+}
+
 func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
@@ -471,8 +579,33 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get user information from LinkedIn API
+	userInfo, err := getLinkedInUserInfo(accessToken)
+	if err != nil {
+		http.Error(w, "Error fetching user information", http.StatusInternalServerError)
+		return
+	}
+
+	// Create a UserSession and store it in Redis
+	userSession := &UserSession{
+		FirstName:           userInfo.FirstName.Localized.EnUS,
+		LastName:            userInfo.LastName.Localized.EnUS,
+		Email:               userInfo.Email.EmailAddress,
+		LinkedInID:          userInfo.ID,
+		LinkedInAccessToken: accessToken,
+		// Fill in other fields as needed
+	}
+	err = storeUserSession(userSession)
+	if err != nil {
+		http.Error(w, "Error storing user session", http.StatusInternalServerError)
+		return
+	}
+
 	callbackURL := fmt.Sprintf("%s?access_token=%s", redirectURI, accessToken)
 	http.Redirect(w, r, callbackURL, http.StatusTemporaryRedirect)
+	// Return the user information instead of the access token
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(userSession)
 }
 
 func requestAccessToken(code, state string) (string, error) {
