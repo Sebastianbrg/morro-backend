@@ -641,14 +641,14 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
 
-	accessToken, err := requestAccessToken(code, state)
+	a, err := requestAccessToken(code, state)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	// Get user information from LinkedIn API
-	userInfo, err := getLinkedInUserInfo(accessToken)
+	userInfo, err := getLinkedInUserInfo(a.AccessToken)
 	if err != nil {
 		http.Error(w, "Error fetching user information", http.StatusInternalServerError)
 		return
@@ -660,7 +660,8 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		LastName:            userInfo.LastName.Localized.EnUS,
 		Email:               userInfo.Email.EmailAddress,
 		LinkedInID:          userInfo.ID,
-		LinkedInAccessToken: accessToken,
+		LinkedInAccessToken: a.AccessToken,
+		LinkedInExpiresIn:   int64(a.ExpiresIn),
 		// Fill in other fields as needed
 	}
 	err = storeUserSession(userSession)
@@ -669,14 +670,17 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	callbackURL := fmt.Sprintf("%s?access_token=%s", redirectURI, accessToken)
+	callbackURL := fmt.Sprintf("%s?access_token=%s", redirectURI, a.AccessToken)
 	http.Redirect(w, r, callbackURL, http.StatusTemporaryRedirect)
 	// Return the user information instead of the access token
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(userSession)
 }
 
-func requestAccessToken(code, state string) (string, error) {
+func requestAccessToken(code, state string) (struct {
+	AccessToken string `json:"access_token"`
+	ExpiresIn   int    `json:"expires_in"`
+}, error) {
 	data := url.Values{}
 	data.Set("grant_type", "authorization_code")
 	data.Set("code", code)
@@ -687,7 +691,10 @@ func requestAccessToken(code, state string) (string, error) {
 	client := &http.Client{}
 	req, err := http.NewRequest("POST", "https://www.linkedin.com/oauth/v2/accessToken", ioutil.NopCloser(strings.NewReader(data.Encode())))
 	if err != nil {
-		return "", err
+		return struct {
+			AccessToken string `json:"access_token"`
+			ExpiresIn   int    `json:"expires_in"`
+		}{}, err
 	}
 
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
@@ -695,20 +702,27 @@ func requestAccessToken(code, state string) (string, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return struct {
+			AccessToken string `json:"access_token"`
+			ExpiresIn   int    `json:"expires_in"`
+		}{}, err
 	}
 	defer resp.Body.Close()
 
 	var result struct {
 		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
 	}
 
 	err = json.NewDecoder(resp.Body).Decode(&result)
 	if err != nil {
-		return "", err
+		return struct {
+			AccessToken string `json:"access_token"`
+			ExpiresIn   int    `json:"expires_in"`
+		}{}, err
 	}
 
-	return result.AccessToken, nil
+	return result, nil
 }
 
 func generateRandomString(length int) string {
