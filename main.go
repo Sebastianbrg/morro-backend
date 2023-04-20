@@ -36,10 +36,6 @@ var (
 	redirectURI  string
 )
 
-func initDB() {
-
-}
-
 var db *sql.DB
 var rdb *redis.Client
 var ctx = context.Background()
@@ -89,12 +85,15 @@ func main() {
 	http.Handle("/user/stats/", http.StripPrefix("/user/stats/", http.HandlerFunc(handleGetUserStats)))
 	http.Handle("/company/stats/", http.StripPrefix("/company/stats/", jwtAuthMiddleware(http.HandlerFunc(handleGetCompanyStats))))
 	http.HandleFunc("/company/leaderboard/", handleGetLeaderboard)
+	// Add the new route for the getUserInfoHandler
+	http.HandleFunc("/userinfo", getUserInfoHandler)
 
 	log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), nil))
 
 }
 
 type UserSession struct {
+	CompanyID              int
 	UserID                 int // Database user ID
 	FirstName              string
 	LastName               string
@@ -123,7 +122,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 			}
 			return jwtSecretKey, nil
 		})
@@ -279,6 +278,19 @@ func handleGetUserStats(w http.ResponseWriter, r *http.Request) {
 	userID, err := strconv.Atoi(userIDStr)
 	if err != nil {
 		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		return
+	}
+
+	// Get the user ID from the context
+	contextUserID, ok := r.Context().Value("userID").(int)
+	if !ok {
+		http.Error(w, "Error getting user ID from context", http.StatusInternalServerError)
+		return
+	}
+
+	// Check if the provided userID matches the one in the context
+	if userID != contextUserID {
+		http.Error(w, "Unauthorized access", http.StatusUnauthorized)
 		return
 	}
 
@@ -664,14 +676,102 @@ func createUser(firstName, lastName, linkedinID string) (int, error) {
 	}
 	return userID, nil
 }
+func verifyTokenAndExtractClaims(tokenString string) (jwt.MapClaims, error) {
+	// Parse the token string
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+
+		// Check the signing method
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+		}
+		return jwtSecretKey, nil
+	})
+
+	// Check for errors and validate the token
+	if err != nil {
+		fmt.Println(err)
+		return nil, err
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		return claims, nil
+	}
+
+	return nil, errors.New("Invalid token")
+}
+
+func getUserInfoHandler(w http.ResponseWriter, r *http.Request) {
+	// Parse the JWT token from the request header
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Authorization header required", http.StatusUnauthorized)
+		return
+	}
+
+	// Split the header into "Bearer" and the actual token.
+	headerParts := strings.Split(authHeader, " ")
+	if len(headerParts) != 2 || headerParts[0] != "Bearer" {
+		http.Error(w, "Invalid authorization header", http.StatusUnauthorized)
+		return
+	}
+
+	// Get the token without the "Bearer" prefix.
+	tokenString := headerParts[1]
+	// Verify the token and extract the claims (you can use your JWT library functions for this)
+	// Verify the token and extract the claims
+	claims, err := verifyTokenAndExtractClaims(tokenString)
+	if err != nil {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	// Use the claims to fetch the user information
+	// For example, you can use the UserID to fetch the user's data from your database
+	userID, ok := claims["userID"].(float64)
+	if !ok {
+		http.Error(w, "Invalid userID claim", http.StatusBadRequest)
+		return
+	}
+
+	// Fetch the user information based on the claims
+	user, err := getUserSession(int(userID))
+	if err != nil {
+		// Handle the error
+		fmt.Println(err)
+	}
+
+	// Prepare the user information response
+	response := struct {
+		CompanyID int    `json:"company_id"`
+		UserID    int    `json:"user_id"`
+		FirstName string `json:"first_name"`
+		LastName  string `json:"last_name"`
+	}{
+		CompanyID: user.CompanyID,
+		UserID:    user.UserID,
+		FirstName: user.FirstName,
+		LastName:  user.LastName,
+	}
+
+	// Return the user information as JSON
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
 
 func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if len(token) > 0 {
+		time.Sleep(time.Second * 10)
+		http.Error(w, "It took too long ", http.StatusInternalServerError)
+		return
+	}
 	code := r.URL.Query().Get("code")
+
 	state := r.URL.Query().Get("state")
 	user := new(User)
 
 	a, err := requestAccessToken(code, state)
-	fmt.Println("Access Token:", a)
+
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -679,7 +779,7 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Get user information from LinkedIn API
 	userInfo, err := getLinkedInUserInfo(a.AccessToken)
-	fmt.Println("User Info:", userInfo)
+
 	if err != nil {
 		http.Error(w, "Error fetching user information", http.StatusInternalServerError)
 		return
@@ -687,7 +787,6 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	linkedinID := userInfo.ID
 	user, err = getUserByLinkedinID(linkedinID)
-	fmt.Println("User:", user)
 
 	if err != nil && err != sql.ErrNoRows {
 		fmt.Println("no user was found")
@@ -730,25 +829,10 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := struct {
-		UserID    int    `json:"user_id"`
-		FirstName string `json:"first_name"`
-		LastName  string `json:"last_name"`
-		Token     string `json:"token"`
-	}{
-		UserID:    user.ID,
-		FirstName: user.FirstName,
-		LastName:  user.LastName,
-		Token:     jwtToken,
-	}
-
-	fmt.Println("Response :", response)
-
-	callbackURL := fmt.Sprintf("%s?access_token=%s", redirectURI, a.AccessToken)
-	http.Redirect(w, r, callbackURL, http.StatusTemporaryRedirect)
-	// Return the user information instead of the access token
+	callbackURL := fmt.Sprintf("%s?token=%s", redirectURI, jwtToken)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	http.Redirect(w, r, callbackURL, http.StatusTemporaryRedirect)
+
 }
 
 func requestAccessToken(code, state string) (struct {
