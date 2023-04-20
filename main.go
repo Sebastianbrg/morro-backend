@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -144,11 +145,27 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func storeUserSession(userSession *UserSession) error {
+	if userSession.UserID == 0 {
+		return errors.New("we cannot store users with id 0")
+	}
 	jsonData, err := json.Marshal(userSession)
 	if err != nil {
 		return err
 	}
 	return rdb.Set(ctx, fmt.Sprintf("user_session:%d", userSession.UserID), jsonData, 0).Err()
+}
+
+func getUserByLinkedinID(linkedinID string) (*User, error) {
+	var user User
+	query := `SELECT id, first_name, last_name, company_id, linkedin_id FROM users WHERE linkedin_id = $1`
+	err := db.QueryRow(query, linkedinID).Scan(&user.ID, &user.FirstName, &user.LastName, &user.CompanyID, &user.LinkedinID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
 }
 
 func getUserSession(userID int) (*UserSession, error) {
@@ -368,10 +385,11 @@ func createTables(db *sql.DB) error {
 }
 
 type User struct {
-	ID        int
-	FirstName string
-	LastName  string
-	CompanyID int
+	ID         int
+	FirstName  string
+	LastName   string
+	CompanyID  int
+	LinkedinID string
 }
 
 func insertUser(db *sql.DB, user User) (int, error) {
@@ -637,11 +655,23 @@ func getLinkedInUserInfo(accessToken string) (*LinkedInUserInfo, error) {
 	return &userInfo, nil
 }
 
+func createUser(firstName, lastName, linkedinID string) (int, error) {
+	query := `INSERT INTO users (first_name, last_name, linkedin_id) VALUES ($1, $2, $3) RETURNING id`
+	var userID int
+	err := db.QueryRow(query, firstName, lastName, linkedinID).Scan(&userID)
+	if err != nil {
+		return 0, err
+	}
+	return userID, nil
+}
+
 func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
+	user := new(User)
 
 	a, err := requestAccessToken(code, state)
+	fmt.Println("Access Token:", a)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -649,13 +679,43 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Get user information from LinkedIn API
 	userInfo, err := getLinkedInUserInfo(a.AccessToken)
+	fmt.Println("User Info:", userInfo)
 	if err != nil {
 		http.Error(w, "Error fetching user information", http.StatusInternalServerError)
 		return
 	}
 
+	linkedinID := userInfo.ID
+	user, err = getUserByLinkedinID(linkedinID)
+	fmt.Println("User:", user)
+
+	if err != nil && err != sql.ErrNoRows {
+		fmt.Println("no user was found")
+	}
+
+	if user == nil { // Check if the user is nil before creating a new user
+		userID, err := createUser(userInfo.FirstName.Localized.EnUS, userInfo.LastName.Localized.EnUS, userInfo.ID)
+		if err != nil {
+			http.Error(w, "Failed to create user", http.StatusInternalServerError)
+			return
+		}
+		user = &User{
+			ID:         userID,
+			FirstName:  userInfo.FirstName.Localized.EnUS,
+			LastName:   userInfo.LastName.Localized.EnUS,
+			LinkedinID: userInfo.ID,
+		}
+	}
+
+	jwtToken, err := createJWTTokenSimple(user.ID)
+	if err != nil {
+		http.Error(w, "Failed to generate JWT token", http.StatusInternalServerError)
+		return
+	}
+
 	// Create a UserSession and store it in Redis
 	userSession := &UserSession{
+		UserID:              user.ID,
 		FirstName:           userInfo.FirstName.Localized.EnUS,
 		LastName:            userInfo.LastName.Localized.EnUS,
 		Email:               userInfo.Email.EmailAddress,
@@ -670,11 +730,25 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	response := struct {
+		UserID    int    `json:"user_id"`
+		FirstName string `json:"first_name"`
+		LastName  string `json:"last_name"`
+		Token     string `json:"token"`
+	}{
+		UserID:    user.ID,
+		FirstName: user.FirstName,
+		LastName:  user.LastName,
+		Token:     jwtToken,
+	}
+
+	fmt.Println("Response :", response)
+
 	callbackURL := fmt.Sprintf("%s?access_token=%s", redirectURI, a.AccessToken)
 	http.Redirect(w, r, callbackURL, http.StatusTemporaryRedirect)
 	// Return the user information instead of the access token
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(userSession)
+	json.NewEncoder(w).Encode(response)
 }
 
 func requestAccessToken(code, state string) (struct {
