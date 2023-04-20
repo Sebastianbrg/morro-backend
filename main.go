@@ -66,18 +66,139 @@ func main() {
 		log.Fatalf("Error generating synthetic data: %v", err)
 	} */
 
-	data, err := getLeaderboard(db, 1)
-	fmt.Println(data)
-	if err != nil {
-		log.Fatalf("Error getting leaderboard: %v", err)
-	}
-
 	http.HandleFunc("/submit", submitHandler)
 	http.HandleFunc("/auth/linkedin", linkedinAuthHandler)
 	http.HandleFunc("/auth/linkedin/callback", linkedinCallbackHandler)
 	http.HandleFunc("/login", login)
+	http.Handle("/user/stats/", http.StripPrefix("/user/stats/", http.HandlerFunc(handleGetUserStats)))
+	http.Handle("/company/stats/", http.StripPrefix("/company/stats/", http.HandlerFunc(handleGetCompanyStats)))
+	http.HandleFunc("/company/leaderboard/", handleGetLeaderboard)
+
 	log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), nil))
 
+}
+
+func handleGetLeaderboard(w http.ResponseWriter, r *http.Request) {
+	leaderboard, err := getLeaderboard()
+	if err != nil {
+		http.Error(w, "Error retrieving leaderboard", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(leaderboard)
+}
+
+func getLeaderboard() ([]CompanyStats, error) {
+	query := `SELECT c.id, c.name, SUM(r.distance) as total_distance, SUM(r.co2_saved) as total_co2_saved
+              FROM companies c
+              JOIN users u ON u.company_id = c.id
+              JOIN rides r ON u.id = r.user_id
+              GROUP BY c.id
+              ORDER BY total_co2_saved DESC`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var leaderboard []CompanyStats
+
+	for rows.Next() {
+		var entry CompanyStats
+
+		err := rows.Scan(&entry.ID, &entry.Name, &entry.TotalDistance, &entry.TotalCO2Saved)
+		if err != nil {
+			return nil, err
+		}
+
+		leaderboard = append(leaderboard, entry)
+	}
+
+	return leaderboard, rows.Err()
+}
+
+func getCompanyStats(companyID int) (CompanyStats, error) {
+	var stats CompanyStats
+	query := `
+		SELECT SUM(rides.distance) AS total_distance, SUM(rides.co2_saved) AS total_co2_saved
+		FROM rides
+		INNER JOIN users ON users.id = rides.user_id
+		WHERE users.company_id = $1;
+	`
+
+	err := db.QueryRow(query, companyID).Scan(&stats.TotalDistance, &stats.TotalCO2Saved)
+	if err != nil {
+		return CompanyStats{}, err
+	}
+
+	return stats, nil
+}
+
+func handleGetCompanyStats(w http.ResponseWriter, r *http.Request) {
+	companyIDStr := strings.TrimPrefix(r.URL.Path, "/company/stats/")
+
+	companyID, err := strconv.Atoi(companyIDStr)
+	if err != nil {
+		http.Error(w, "Invalid company ID", http.StatusBadRequest)
+		return
+	}
+
+	stats, err := getCompanyStats(companyID)
+	if err != nil {
+		http.Error(w, "Error retrieving company stats", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+type CompanyStats struct {
+	ID            int     `json:"id"`
+	Name          string  `json:"name"`
+	TotalDistance float64 `json:"total_distance"`
+	TotalCO2Saved float64 `json:"total_co2_saved"`
+}
+
+type UserStats struct {
+	TotalDistance float64 `json:"total_distance"`
+	TotalCO2Saved float64 `json:"total_co2_saved"`
+}
+
+func handleGetUserStats(w http.ResponseWriter, r *http.Request) {
+	// Remove the "/user/stats/" prefix from the path
+	userIDStr := strings.TrimPrefix(r.URL.Path, "/user/stats/")
+
+	userID, err := strconv.Atoi(userIDStr)
+	if err != nil {
+		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		return
+	}
+
+	stats, err := getUserStats(userID)
+	if err != nil {
+		http.Error(w, "Error retrieving user stats", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+func getUserStats(userID int) (UserStats, error) {
+	var userStats UserStats
+	var err error
+
+	// Replace with your actual DB connection and query execution
+	err = db.QueryRow("SELECT SUM(distance), SUM(co2_saved) FROM rides WHERE user_id = $1", userID).Scan(&userStats.TotalDistance, &userStats.TotalCO2Saved)
+
+	if err != nil {
+		return UserStats{}, err
+	}
+
+	return userStats, nil
 }
 
 func randFloat(reader io.Reader) (float64, error) {
@@ -264,45 +385,6 @@ func generateJWT(user *User) (string, error) {
 	}
 
 	return signedToken, nil
-}
-
-func getLeaderboard(db *sql.DB, companyID int) ([]map[string]interface{}, error) {
-	query := `SELECT u.id, u.first_name, u.last_name, SUM(r.distance) as total_distance, SUM(r.co2_saved) as total_co2_saved
-	          FROM users u
-	          JOIN rides r ON u.id = r.user_id
-	          WHERE u.company_id = $1
-	          GROUP BY u.id
-	          ORDER BY total_co2_saved DESC`
-
-	rows, err := db.Query(query, companyID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var leaderboard []map[string]interface{}
-
-	for rows.Next() {
-		var id int
-		var firstName, lastName string
-		var totalDistance, totalCo2Saved float64
-
-		err := rows.Scan(&id, &firstName, &lastName, &totalDistance, &totalCo2Saved)
-		if err != nil {
-			return nil, err
-		}
-
-		entry := map[string]interface{}{
-			"id":            id,
-			"firstName":     firstName,
-			"lastName":      lastName,
-			"totalDistance": totalDistance,
-			"totalCo2Saved": totalCo2Saved,
-		}
-		leaderboard = append(leaderboard, entry)
-	}
-
-	return leaderboard, rows.Err()
 }
 
 func getRandomCompany() string {
