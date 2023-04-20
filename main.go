@@ -27,7 +27,7 @@ import (
 
 type DistanceRequest struct {
 	Distance float64 `json:"distance"`
-	Company  string  `json:"company"`
+	CO2Saved float64
 }
 
 var (
@@ -42,6 +42,10 @@ var ctx = context.Background()
 
 // Sign the token using a secret key
 var jwtSecretKey = []byte(os.Getenv("JWT_SECRET"))
+
+type contextKey string
+
+const userIDKey contextKey = "userID"
 
 func main() {
 	var err error
@@ -78,15 +82,15 @@ func main() {
 		log.Fatalf("Error generating synthetic data: %v", err)
 	} */
 
-	http.HandleFunc("/submit", submitHandler)
+	http.Handle("/ride/complete", jwtAuthMiddleware(http.HandlerFunc(rideHandler)))
 	http.HandleFunc("/auth/linkedin", linkedinAuthHandler)
 	http.HandleFunc("/auth/linkedin/callback", linkedinCallbackHandler)
 	http.HandleFunc("/login", login)
-	http.Handle("/user/stats/", http.StripPrefix("/user/stats/", http.HandlerFunc(handleGetUserStats)))
+	http.Handle("/user/stats/", jwtAuthMiddleware(http.HandlerFunc(handleGetUserStats)))
 	http.Handle("/company/stats/", http.StripPrefix("/company/stats/", jwtAuthMiddleware(http.HandlerFunc(handleGetCompanyStats))))
 	http.HandleFunc("/company/leaderboard/", handleGetLeaderboard)
 	// Add the new route for the getUserInfoHandler
-	http.HandleFunc("/userinfo", getUserInfoHandler)
+	http.Handle("/userinfo", jwtAuthMiddleware(http.HandlerFunc(getUserInfoHandler)))
 
 	log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), nil))
 
@@ -112,14 +116,22 @@ type UserSession struct {
 
 func jwtAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Parse the JWT token from the request header
 		authHeader := r.Header.Get("Authorization")
-		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+		if authHeader == "" {
+			http.Error(w, "Authorization header required", http.StatusUnauthorized)
+			return
+		}
 
-		if tokenString == "" {
+		// Split the header into "Bearer" and the actual token.
+		headerParts := strings.Split(authHeader, " ")
+		if len(headerParts) != 2 || headerParts[0] != "Bearer" {
 			http.Error(w, "Invalid authorization header", http.StatusUnauthorized)
 			return
 		}
 
+		// Get the token without the "Bearer" prefix.
+		tokenString := headerParts[1]
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -134,11 +146,20 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 		claims, ok := token.Claims.(jwt.MapClaims)
 		if !ok || claims["userID"] == nil {
+			fmt.Println("Invalid token claims")
 			http.Error(w, "Invalid token claims", http.StatusUnauthorized)
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), "userID", claims["userID"])
+		userID, ok := claims["userID"].(float64)
+
+		if !ok {
+			fmt.Println("Invalid token claims userID")
+			http.Error(w, "Invalid token claims", http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(r.Context(), userIDKey, int(userID))
+
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -183,6 +204,7 @@ func getUserSession(userID int) (*UserSession, error) {
 func handleGetLeaderboard(w http.ResponseWriter, r *http.Request) {
 	leaderboard, err := getLeaderboard()
 	if err != nil {
+		fmt.Println("6")
 		http.Error(w, "Error retrieving leaderboard", http.StatusInternalServerError)
 		return
 	}
@@ -239,7 +261,7 @@ func getCompanyStats(companyID int) (CompanyStats, error) {
 }
 
 func handleGetCompanyStats(w http.ResponseWriter, r *http.Request) {
-	userID, _ := r.Context().Value("userID").(int)
+
 	companyIDStr := strings.TrimPrefix(r.URL.Path, "/company/stats/")
 
 	companyID, err := strconv.Atoi(companyIDStr)
@@ -247,7 +269,6 @@ func handleGetCompanyStats(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid company ID", http.StatusBadRequest)
 		return
 	}
-	fmt.Println("User ID from token: ", userID)
 
 	stats, err := getCompanyStats(companyID)
 	if err != nil {
@@ -272,15 +293,6 @@ type UserStats struct {
 }
 
 func handleGetUserStats(w http.ResponseWriter, r *http.Request) {
-	// Remove the "/user/stats/" prefix from the path
-	userIDStr := strings.TrimPrefix(r.URL.Path, "/user/stats/")
-
-	userID, err := strconv.Atoi(userIDStr)
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
-
 	// Get the user ID from the context
 	contextUserID, ok := r.Context().Value("userID").(int)
 	if !ok {
@@ -288,14 +300,10 @@ func handleGetUserStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if the provided userID matches the one in the context
-	if userID != contextUserID {
-		http.Error(w, "Unauthorized access", http.StatusUnauthorized)
-		return
-	}
+	stats, err := getUserStats(contextUserID)
 
-	stats, err := getUserStats(userID)
 	if err != nil {
+		fmt.Println(err)
 		http.Error(w, "Error retrieving user stats", http.StatusInternalServerError)
 		return
 	}
@@ -327,7 +335,8 @@ func randFloat(reader io.Reader) (float64, error) {
 	return float64(bigInt.Int64()) / float64(max), nil
 }
 
-func submitHandler(w http.ResponseWriter, r *http.Request) {
+func rideHandler(w http.ResponseWriter, r *http.Request) {
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -340,10 +349,34 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.Company = getRandomCompany()
+	// Get the user ID from the context
+	contextUserID, ok := r.Context().Value(userIDKey).(int)
+	if !ok {
+		http.Error(w, "Error getting user ID from context", http.StatusInternalServerError)
+		return
+	}
 
-	log.Printf("Received data: distance=%.2f, company=%s", req.Distance, req.Company)
+	// Calculate CO2 saved
+	carEmissionFactor := 0.12 // kg CO2 per km (average car emission factor)
+	co2Saved := req.Distance * carEmissionFactor
+
+	// Create a new Ride instance
+	ride := Ride{
+		Distance:  req.Distance,
+		CO2Saved:  co2Saved, //
+		UserID:    contextUserID,
+		Timestamp: time.Now(),
+	}
+
+	// Insert the ride into the database
+	err = insertRide(db, &ride)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusCreated)
+
 }
 
 type Ride struct {
@@ -354,11 +387,12 @@ type Ride struct {
 	Timestamp time.Time
 }
 
-func insertRide(db *sql.DB, ride Ride) (int, error) {
-	query := `INSERT INTO rides (user_id, distance, co2_saved, timestamp) VALUES ($1, $2, $3, $4) RETURNING id`
-	var id int
-	err := db.QueryRow(query, ride.UserID, ride.Distance, ride.CO2Saved, time.Now().Add(time.Duration(randomInt(-30, 0))*24*time.Hour)).Scan(&id)
-	return id, err
+func insertRide(db *sql.DB, ride *Ride) error {
+	query := `INSERT INTO rides (distance, co2_saved, user_id, timestamp)
+			VALUES ($1, $2, $3, $4) RETURNING id`
+
+	err := db.QueryRow(query, ride.Distance, ride.CO2Saved, ride.UserID, ride.Timestamp).Scan(&ride.ID)
+	return err
 }
 
 func createTables(db *sql.DB) error {
@@ -454,7 +488,7 @@ func generateSyntheticData(db *sql.DB) error {
 				CO2Saved:  randomFloat64(0.5, 5),
 				Timestamp: time.Now().Add(time.Duration(randomInt(-30, 0)) * 24 * time.Hour),
 			}
-			_, err := insertRide(db, ride)
+			err := insertRide(db, &ride)
 			if err != nil {
 				return fmt.Errorf("Error inserting ride: %v", err)
 			}
@@ -689,7 +723,6 @@ func verifyTokenAndExtractClaims(tokenString string) (jwt.MapClaims, error) {
 
 	// Check for errors and validate the token
 	if err != nil {
-		fmt.Println(err)
 		return nil, err
 	}
 
@@ -697,44 +730,20 @@ func verifyTokenAndExtractClaims(tokenString string) (jwt.MapClaims, error) {
 		return claims, nil
 	}
 
-	return nil, errors.New("Invalid token")
+	return nil, errors.New("Invalid token creation")
 }
 
 func getUserInfoHandler(w http.ResponseWriter, r *http.Request) {
-	// Parse the JWT token from the request header
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		http.Error(w, "Authorization header required", http.StatusUnauthorized)
-		return
-	}
 
-	// Split the header into "Bearer" and the actual token.
-	headerParts := strings.Split(authHeader, " ")
-	if len(headerParts) != 2 || headerParts[0] != "Bearer" {
-		http.Error(w, "Invalid authorization header", http.StatusUnauthorized)
-		return
-	}
-
-	// Get the token without the "Bearer" prefix.
-	tokenString := headerParts[1]
-	// Verify the token and extract the claims (you can use your JWT library functions for this)
-	// Verify the token and extract the claims
-	claims, err := verifyTokenAndExtractClaims(tokenString)
-	if err != nil {
-		http.Error(w, "Invalid token", http.StatusUnauthorized)
-		return
-	}
-
-	// Use the claims to fetch the user information
-	// For example, you can use the UserID to fetch the user's data from your database
-	userID, ok := claims["userID"].(float64)
+	// Get the user ID from the context
+	contextUserID, ok := r.Context().Value(userIDKey).(int)
 	if !ok {
-		http.Error(w, "Invalid userID claim", http.StatusBadRequest)
+		http.Error(w, "Error getting user ID from context", http.StatusInternalServerError)
 		return
 	}
 
 	// Fetch the user information based on the claims
-	user, err := getUserSession(int(userID))
+	user, err := getUserSession(contextUserID)
 	if err != nil {
 		// Handle the error
 		fmt.Println(err)
@@ -787,11 +796,6 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	linkedinID := userInfo.ID
 	user, err = getUserByLinkedinID(linkedinID)
-
-	if err != nil && err != sql.ErrNoRows {
-		fmt.Println("no user was found")
-	}
-
 	if user == nil { // Check if the user is nil before creating a new user
 		userID, err := createUser(userInfo.FirstName.Localized.EnUS, userInfo.LastName.Localized.EnUS, userInfo.ID)
 		if err != nil {
