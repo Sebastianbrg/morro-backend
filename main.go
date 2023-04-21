@@ -356,6 +356,12 @@ func rideHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Distance == 0 {
+		fmt.Println("people are not really using the service. Userid: ", contextUserID)
+		http.Error(w, "Distance needs to further than 0 meter", http.StatusNotModified)
+		return
+	}
+
 	// Calculate CO2 saved
 	carEmissionFactor := 0.12 // kg CO2 per km (average car emission factor)
 	co2Saved := req.Distance * carEmissionFactor
