@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
@@ -24,6 +25,83 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
+
+type GlobalData struct {
+	User         User
+	Ride         Ride
+	UserSession  UserSession
+	LinkedInInfo LinkedInUserInfo
+	CompanyStats CompanyStats
+	UserStats    UserStats
+	DistanceReq  DistanceRequest
+	Leaderboard  []CompanyStats // Add this field
+}
+type Company struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+type User struct {
+	ID         int
+	FirstName  string
+	LastName   string
+	CompanyID  int
+	LinkedinID string
+}
+
+type Ride struct {
+	ID        int
+	UserID    int
+	Distance  float64
+	CO2Saved  float64
+	Timestamp time.Time
+}
+type UserSession struct {
+	CompanyID              int
+	UserID                 int // Database user ID
+	FirstName              string
+	LastName               string
+	Email                  string
+	LinkedInID             string
+	AppleID                string
+	LinkedInAccessToken    string
+	LinkedInRefreshToken   string
+	LinkedInExpiresIn      int64
+	LinkedInTokenCreatedAt int64
+	AppleAccessToken       string
+	AppleRefreshToken      string
+	AppleExpiresIn         int64
+	AppleTokenCreatedAt    int64
+}
+
+type LinkedInUserInfo struct {
+	ID        string `json:"id"`
+	FirstName struct {
+		Localized struct {
+			EnUS string `json:"en_US"`
+		} `json:"localized"`
+	} `json:"firstName"`
+	LastName struct {
+		Localized struct {
+			EnUS string `json:"en_US"`
+		} `json:"localized"`
+	} `json:"lastName"`
+	Email struct {
+		EmailAddress string `json:"emailAddress"`
+	} `json:"elements"`
+}
+
+type CompanyStats struct {
+	ID            int     `json:"id"`
+	Name          string  `json:"name"`
+	TotalDistance float64 `json:"total_distance"`
+	TotalCO2Saved float64 `json:"total_co2_saved"`
+}
+
+type UserStats struct {
+	TotalDistance float64 `json:"total_distance"`
+	TotalCO2Saved float64 `json:"total_co2_saved"`
+}
 
 type DistanceRequest struct {
 	Distance float64 `json:"distance"`
@@ -36,16 +114,17 @@ var (
 	redirectURI  string
 )
 
-var db *sql.DB
-var rdb *redis.Client
-var ctx = context.Background()
-
-// Sign the token using a secret key
-var jwtSecretKey = []byte(os.Getenv("JWT_SECRET"))
-
 type contextKey string
 
 const userIDKey contextKey = "userID"
+
+var db *sql.DB
+var rdb *redis.Client
+var ctx = context.Background()
+var userDataCache sync.Map
+
+// Sign the token using a secret key
+var jwtSecretKey = []byte(os.Getenv("JWT_SECRET"))
 
 func main() {
 	var err error
@@ -82,36 +161,142 @@ func main() {
 		log.Fatalf("Error generating synthetic data: %v", err)
 	} */
 
+	http.Handle("/user", jwtAuthMiddleware(http.HandlerFunc(getUserDataHandler)))
 	http.Handle("/ride/complete", jwtAuthMiddleware(http.HandlerFunc(rideHandler)))
 	http.HandleFunc("/auth/linkedin", linkedinAuthHandler)
 	http.HandleFunc("/auth/linkedin/callback", linkedinCallbackHandler)
 	http.HandleFunc("/login", login)
-	http.Handle("/user/stats/", jwtAuthMiddleware(http.HandlerFunc(handleGetUserStats)))
-	http.Handle("/company/stats/", http.StripPrefix("/company/stats/", jwtAuthMiddleware(http.HandlerFunc(handleGetCompanyStats))))
 	http.HandleFunc("/company/leaderboard/", handleGetLeaderboard)
 	// Add the new route for the getUserInfoHandler
-	http.Handle("/userinfo", jwtAuthMiddleware(http.HandlerFunc(getUserInfoHandler)))
 
 	log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), nil))
 
 }
 
-type UserSession struct {
-	CompanyID              int
-	UserID                 int // Database user ID
-	FirstName              string
-	LastName               string
-	Email                  string
-	LinkedInID             string
-	AppleID                string
-	LinkedInAccessToken    string
-	LinkedInRefreshToken   string
-	LinkedInExpiresIn      int64
-	LinkedInTokenCreatedAt int64
-	AppleAccessToken       string
-	AppleRefreshToken      string
-	AppleExpiresIn         int64
-	AppleTokenCreatedAt    int64
+// GetCompanyByID retrieves a company by its ID from the database
+func getCompanyByID(db *sql.DB, id int) (Company, error) {
+	var company Company
+	query := `SELECT id, name FROM companies WHERE id = $1`
+	err := db.QueryRow(query, id).Scan(&company.ID, &company.Name)
+	return company, err
+}
+
+// GetUserByID retrieves a user by its ID from the database
+func getUserByID(db *sql.DB, id int) (User, error) {
+	var user User
+	query := `SELECT id, first_name, last_name, company_id, linkedin_id FROM users WHERE id = $1`
+	err := db.QueryRow(query, id).Scan(&user.ID, &user.FirstName, &user.LastName, &user.CompanyID, &user.LinkedinID)
+	return user, err
+}
+
+// GetRidesByUserID retrieves all rides of a user by the user's ID from the database
+func getRidesByUserID(db *sql.DB, userID int) ([]Ride, error) {
+	var rides []Ride
+	query := `SELECT id, user_id, distance, co2_saved, timestamp FROM rides WHERE user_id = $1`
+	rows, err := db.Query(query, userID)
+	if err != nil {
+		return rides, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ride Ride
+		err = rows.Scan(&ride.ID, &ride.UserID, &ride.Distance, &ride.CO2Saved, &ride.Timestamp)
+		if err != nil {
+			return rides, err
+		}
+		rides = append(rides, ride)
+	}
+
+	return rides, nil
+}
+
+func getUserDataHandler(w http.ResponseWriter, r *http.Request) {
+	var globalData GlobalData
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get the user ID from the context
+	contextUserID, ok := r.Context().Value(userIDKey).(int)
+	if !ok {
+		http.Error(w, "Error getting user ID from context", http.StatusInternalServerError)
+		return
+	}
+
+	// Check if user data exists in Redis
+	redisKey := fmt.Sprintf("user:%d", int(contextUserID))
+	userData, err := rdb.Get(ctx, redisKey).Result()
+	if err != nil {
+
+		// Fetch the leaderboard data
+		leaderboard, err := getLeaderboard()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Fetch user, company, and ride data based on the user ID
+		user, err := getUserByID(db, contextUserID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		company, err := getCompanyByID(db, user.CompanyID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		rides, err := getRidesByUserID(db, contextUserID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Populate the GlobalData structure with the fetched data
+		globalData = GlobalData{
+			User:        user,
+			UserSession: UserSession{CompanyID: user.CompanyID, UserID: user.ID},
+			CompanyStats: CompanyStats{
+				ID:   company.ID,
+				Name: company.Name,
+			},
+			Leaderboard: leaderboard, // Leaderboard data
+		}
+
+		for _, ride := range rides {
+			globalData.UserStats.TotalDistance += ride.Distance
+			globalData.UserStats.TotalCO2Saved += ride.CO2Saved
+		}
+
+		// Store the user data in Redis
+		userDataJSON, err := json.Marshal(globalData)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		err = rdb.Set(ctx, fmt.Sprintf("user_data:%d", contextUserID), userDataJSON, 0).Err()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Send the GlobalData structure as a JSON response
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(globalData)
+		return
+	}
+
+	err = json.Unmarshal([]byte(userData), &globalData)
+	if err != nil {
+		http.Error(w, "Error unmarshalling user data from cache", http.StatusInternalServerError)
+		return
+	}
+
 }
 
 func jwtAuthMiddleware(next http.Handler) http.Handler {
@@ -158,21 +343,19 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "Invalid token claims", http.StatusUnauthorized)
 			return
 		}
-		ctx := context.WithValue(r.Context(), userIDKey, int(userID))
 
+		// Check token expiration
+		_, ok = claims["exp"].(float64)
+		if !ok {
+			fmt.Println("Invalid expiry of token. Request a new one")
+
+			http.Error(w, "Invalid expiry of token. Request a new one: ", http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), userIDKey, int(userID))
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
-}
-
-func storeUserSession(userSession *UserSession) error {
-	if userSession.UserID == 0 {
-		return errors.New("we cannot store users with id 0")
-	}
-	jsonData, err := json.Marshal(userSession)
-	if err != nil {
-		return err
-	}
-	return rdb.Set(ctx, fmt.Sprintf("user_session:%d", userSession.UserID), jsonData, 0).Err()
 }
 
 func getUserByLinkedinID(linkedinID string) (*User, error) {
@@ -186,19 +369,6 @@ func getUserByLinkedinID(linkedinID string) (*User, error) {
 		return nil, err
 	}
 	return &user, nil
-}
-
-func getUserSession(userID int) (*UserSession, error) {
-	jsonData, err := rdb.Get(ctx, fmt.Sprintf("user_session:%d", userID)).Bytes()
-	if err != nil {
-		return nil, err
-	}
-	var userSession UserSession
-	err = json.Unmarshal(jsonData, &userSession)
-	if err != nil {
-		return nil, err
-	}
-	return &userSession, nil
 }
 
 func handleGetLeaderboard(w http.ResponseWriter, r *http.Request) {
@@ -241,89 +411,6 @@ func getLeaderboard() ([]CompanyStats, error) {
 	}
 
 	return leaderboard, rows.Err()
-}
-
-func getCompanyStats(companyID int) (CompanyStats, error) {
-	var stats CompanyStats
-	query := `
-		SELECT SUM(rides.distance) AS total_distance, SUM(rides.co2_saved) AS total_co2_saved
-		FROM rides
-		INNER JOIN users ON users.id = rides.user_id
-		WHERE users.company_id = $1;
-	`
-
-	err := db.QueryRow(query, companyID).Scan(&stats.TotalDistance, &stats.TotalCO2Saved)
-	if err != nil {
-		return CompanyStats{}, err
-	}
-
-	return stats, nil
-}
-
-func handleGetCompanyStats(w http.ResponseWriter, r *http.Request) {
-
-	companyIDStr := strings.TrimPrefix(r.URL.Path, "/company/stats/")
-
-	companyID, err := strconv.Atoi(companyIDStr)
-	if err != nil {
-		http.Error(w, "Invalid company ID", http.StatusBadRequest)
-		return
-	}
-
-	stats, err := getCompanyStats(companyID)
-	if err != nil {
-		http.Error(w, "Error retrieving company stats", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
-}
-
-type CompanyStats struct {
-	ID            int     `json:"id"`
-	Name          string  `json:"name"`
-	TotalDistance float64 `json:"total_distance"`
-	TotalCO2Saved float64 `json:"total_co2_saved"`
-}
-
-type UserStats struct {
-	TotalDistance float64 `json:"total_distance"`
-	TotalCO2Saved float64 `json:"total_co2_saved"`
-}
-
-func handleGetUserStats(w http.ResponseWriter, r *http.Request) {
-	// Get the user ID from the context
-	contextUserID, ok := r.Context().Value("userID").(int)
-	if !ok {
-		http.Error(w, "Error getting user ID from context", http.StatusInternalServerError)
-		return
-	}
-
-	stats, err := getUserStats(contextUserID)
-
-	if err != nil {
-		fmt.Println(err)
-		http.Error(w, "Error retrieving user stats", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
-}
-
-func getUserStats(userID int) (UserStats, error) {
-	var userStats UserStats
-	var err error
-
-	// Replace with your actual DB connection and query execution
-	err = db.QueryRow("SELECT SUM(distance), SUM(co2_saved) FROM rides WHERE user_id = $1", userID).Scan(&userStats.TotalDistance, &userStats.TotalCO2Saved)
-
-	if err != nil {
-		return UserStats{}, err
-	}
-
-	return userStats, nil
 }
 
 func randFloat(reader io.Reader) (float64, error) {
@@ -385,14 +472,6 @@ func rideHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
-type Ride struct {
-	ID        int
-	UserID    int
-	Distance  float64
-	CO2Saved  float64
-	Timestamp time.Time
-}
-
 func insertRide(db *sql.DB, ride *Ride) error {
 	query := `INSERT INTO rides (distance, co2_saved, user_id, timestamp)
 			VALUES ($1, $2, $3, $4) RETURNING id`
@@ -436,14 +515,6 @@ func createTables(db *sql.DB) error {
 	return err
 }
 
-type User struct {
-	ID         int
-	FirstName  string
-	LastName   string
-	CompanyID  int
-	LinkedinID string
-}
-
 func insertUser(db *sql.DB, user User) (int, error) {
 	query := `INSERT INTO users (first_name, last_name, company_id) VALUES ($1, $2, $3) RETURNING id`
 	var id int
@@ -462,46 +533,6 @@ func insertCompany(db *sql.DB, name string) (int, error) {
 	var id int
 	err := db.QueryRow(query, name).Scan(&id)
 	return id, err
-}
-
-func generateSyntheticData(db *sql.DB) error {
-	companyNames := []string{"Company A", "Company B", "Company C", "Company D", "Company E"}
-	var companyIDs []int
-
-	for _, companyName := range companyNames {
-		companyID, err := insertCompany(db, companyName)
-		if err != nil {
-			return fmt.Errorf("Error inserting company: %v", err)
-		}
-		companyIDs = append(companyIDs, companyID)
-	}
-
-	for i := 0; i < 100; i++ {
-		user := User{
-			FirstName: fmt.Sprintf("User%d", i+1),
-			LastName:  "Doe",
-			CompanyID: companyIDs[randomInt(0, len(companyIDs))],
-		}
-		userID, err := insertUser(db, user)
-		if err != nil {
-			return fmt.Errorf("Error inserting user: %v", err)
-		}
-
-		for j := 0; j < 10; j++ {
-			ride := Ride{
-				UserID:    userID,
-				Distance:  randomFloat64(1, 20),
-				CO2Saved:  randomFloat64(0.5, 5),
-				Timestamp: time.Now().Add(time.Duration(randomInt(-30, 0)) * 24 * time.Hour),
-			}
-			err := insertRide(db, &ride)
-			if err != nil {
-				return fmt.Errorf("Error inserting ride: %v", err)
-			}
-		}
-	}
-
-	return nil
 }
 
 func storeUserIfNotExists(userInfo *LinkedInUserInfo) (int, error) {
@@ -649,26 +680,8 @@ func login(w http.ResponseWriter, r *http.Request) {
 
 }
 
-type LinkedInUserInfo struct {
-	ID        string `json:"id"`
-	FirstName struct {
-		Localized struct {
-			EnUS string `json:"en_US"`
-		} `json:"localized"`
-	} `json:"firstName"`
-	LastName struct {
-		Localized struct {
-			EnUS string `json:"en_US"`
-		} `json:"localized"`
-	} `json:"lastName"`
-	Email struct {
-		EmailAddress string `json:"emailAddress"`
-	} `json:"elements"`
-}
-
 func getLinkedInUserInfo(accessToken string) (*LinkedInUserInfo, error) {
 	client := &http.Client{}
-
 	// Request basic profile information
 	profileReq, _ := http.NewRequest("GET", "https://api.linkedin.com/v2/me?projection=(id,firstName,lastName)", nil)
 	profileReq.Header.Add("Authorization", "Bearer "+accessToken)
@@ -739,47 +752,16 @@ func verifyTokenAndExtractClaims(tokenString string) (jwt.MapClaims, error) {
 	return nil, errors.New("Invalid token creation")
 }
 
-func getUserInfoHandler(w http.ResponseWriter, r *http.Request) {
-
-	// Get the user ID from the context
-	contextUserID, ok := r.Context().Value(userIDKey).(int)
-	if !ok {
-		http.Error(w, "Error getting user ID from context", http.StatusInternalServerError)
-		return
-	}
-
-	// Fetch the user information based on the claims
-	user, err := getUserSession(contextUserID)
-	if err != nil {
-		// Handle the error
-		fmt.Println(err)
-	}
-
-	// Prepare the user information response
-	response := struct {
-		CompanyID int    `json:"company_id"`
-		UserID    int    `json:"user_id"`
-		FirstName string `json:"first_name"`
-		LastName  string `json:"last_name"`
-	}{
-		CompanyID: user.CompanyID,
-		UserID:    user.UserID,
-		FirstName: user.FirstName,
-		LastName:  user.LastName,
-	}
-
-	// Return the user information as JSON
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
 func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	if len(token) > 0 {
-		time.Sleep(time.Second * 10)
-		http.Error(w, "It took too long ", http.StatusInternalServerError)
+		fmt.Println("Sleeping for 2 seconds: ")
+
+		time.Sleep(time.Second * 2)
+		http.Error(w, "You got the token", http.StatusAccepted)
 		return
 	}
+
 	code := r.URL.Query().Get("code")
 
 	state := r.URL.Query().Get("state")
@@ -809,33 +791,13 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		user = &User{
-			ID:         userID,
-			FirstName:  userInfo.FirstName.Localized.EnUS,
-			LastName:   userInfo.LastName.Localized.EnUS,
-			LinkedinID: userInfo.ID,
+			ID: userID,
 		}
 	}
 
 	jwtToken, err := createJWTTokenSimple(user.ID)
 	if err != nil {
 		http.Error(w, "Failed to generate JWT token", http.StatusInternalServerError)
-		return
-	}
-
-	// Create a UserSession and store it in Redis
-	userSession := &UserSession{
-		UserID:              user.ID,
-		FirstName:           userInfo.FirstName.Localized.EnUS,
-		LastName:            userInfo.LastName.Localized.EnUS,
-		Email:               userInfo.Email.EmailAddress,
-		LinkedInID:          userInfo.ID,
-		LinkedInAccessToken: a.AccessToken,
-		LinkedInExpiresIn:   int64(a.ExpiresIn),
-		// Fill in other fields as needed
-	}
-	err = storeUserSession(userSession)
-	if err != nil {
-		http.Error(w, "Error storing user session", http.StatusInternalServerError)
 		return
 	}
 
