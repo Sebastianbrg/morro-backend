@@ -37,8 +37,9 @@ type GlobalData struct {
 	Leaderboard  []CompanyStats // Add this field
 }
 type Company struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
+	ID      int    `json:"id"`
+	Name    string `json:"name"`
+	LogoURL string `json:"logo_url"`
 }
 
 type User struct {
@@ -96,6 +97,7 @@ type CompanyStats struct {
 	Name          string  `json:"name"`
 	TotalDistance float64 `json:"total_distance"`
 	TotalCO2Saved float64 `json:"total_co2_saved"`
+	LogoURL       string  `json:"logo_url"`
 }
 
 type UserStats struct {
@@ -213,8 +215,8 @@ func updateCompanyHandler(w http.ResponseWriter, r *http.Request) {
 // GetCompanyByID retrieves a company by its ID from the database
 func getCompanyByID(db *sql.DB, id int) (Company, error) {
 	var company Company
-	query := `SELECT id, name FROM companies WHERE id = $1`
-	err := db.QueryRow(query, id).Scan(&company.ID, &company.Name)
+	query := `SELECT id, name, logo_url FROM companies WHERE id = $1`
+	err := db.QueryRow(query, id).Scan(&company.ID, &company.Name, &company.LogoURL)
 	return company, err
 }
 
@@ -299,8 +301,9 @@ func getUserDataHandler(w http.ResponseWriter, r *http.Request) {
 		User:        user,
 		UserSession: UserSession{CompanyID: user.CompanyID, UserID: user.ID},
 		CompanyStats: CompanyStats{
-			ID:   company.ID,
-			Name: company.Name,
+			ID:      company.ID,
+			Name:    company.Name,
+			LogoURL: company.LogoURL, // Add this field
 		},
 		Leaderboard: leaderboard, // Leaderboard data
 	}
@@ -346,6 +349,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 		// Get the token without the "Bearer" prefix.
 		tokenString := headerParts[1]
+
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -364,6 +368,8 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "Invalid token claims", http.StatusUnauthorized)
 			return
 		}
+		fmt.Println("JWT handler claims: ", claims)
+		fmt.Println("Token: ", tokenString)
 
 		userID, ok := claims["userID"].(float64)
 
@@ -649,7 +655,7 @@ func getAllCompaniesHandler() http.HandlerFunc {
 }
 
 func getAllCompanies() ([]Company, error) {
-	query := "SELECT id, name FROM companies"
+	query := "SELECT id, name, logo_url FROM companies"
 	rows, err := db.Query(query)
 	if err != nil {
 		return nil, err
@@ -659,7 +665,7 @@ func getAllCompanies() ([]Company, error) {
 	var companies []Company
 	for rows.Next() {
 		var company Company
-		err := rows.Scan(&company.ID, &company.Name)
+		err := rows.Scan(&company.ID, &company.Name, &company.LogoURL)
 		if err != nil {
 			return nil, err
 		}
