@@ -184,7 +184,7 @@ func main() {
 
 func updateCompanyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-
+		fmt.Println("Invalid method")
 		http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
 		return
 	}
@@ -204,6 +204,7 @@ func updateCompanyHandler(w http.ResponseWriter, r *http.Request) {
 
 	_, err = db.Exec("UPDATE users SET company_id = $1 WHERE id = $2", req.CompanyID, contextUserID)
 	if err != nil {
+		fmt.Println(err)
 		http.Error(w, "Error updating company", http.StatusInternalServerError)
 		return
 	}
@@ -368,11 +369,9 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "Invalid token claims", http.StatusUnauthorized)
 			return
 		}
-		fmt.Println("JWT handler claims: ", claims)
-		fmt.Println("Token: ", tokenString)
 
 		userID, ok := claims["userID"].(float64)
-
+		fmt.Println(userID, " ------------------- user ---------------")
 		if !ok {
 			fmt.Println("Invalid token claims userID")
 			http.Error(w, "Invalid token claims", http.StatusUnauthorized)
@@ -782,11 +781,11 @@ func verifyTokenAndExtractClaims(tokenString string) (jwt.MapClaims, error) {
 }
 
 func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
+
 	token := r.URL.Query().Get("token")
 	if len(token) > 0 {
-		fmt.Println("Sleeping for 2 seconds: ")
 
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Second * 10)
 		http.Error(w, "You got the token", http.StatusAccepted)
 		return
 	}
@@ -799,6 +798,7 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	a, err := requestAccessToken(code, state)
 
 	if err != nil {
+		fmt.Println(err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -807,25 +807,34 @@ func linkedinCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	userInfo, err := getLinkedInUserInfo(a.AccessToken)
 
 	if err != nil {
+		fmt.Println(err)
 		http.Error(w, "Error fetching user information", http.StatusInternalServerError)
 		return
 	}
 
+	fmt.Println("Linkedin Info: ", userInfo)
 	linkedinID := userInfo.ID
 	user, err = getUserByLinkedinID(linkedinID)
+	if err != nil {
+		fmt.Println("error getting userByLinkedInID", err)
+	}
+	fmt.Println("User based on linkedin login: ", user)
 	if user == nil { // Check if the user is nil before creating a new user
 		userID, err := createUser(userInfo.FirstName.Localized.EnUS, userInfo.LastName.Localized.EnUS, userInfo.ID)
 		if err != nil {
-			http.Error(w, "Failed to create user", http.StatusInternalServerError)
+			fmt.Println(err)
+			http.Error(w, "could not create user: +4746546996 to reach Sebastian", http.StatusInternalServerError)
 			return
 		}
 		user = &User{
 			ID: userID,
 		}
+		fmt.Println(userID, " ------------------- user created ---------------")
 	}
 
 	jwtToken, err := createJWTTokenSimple(user.ID)
 	if err != nil {
+		fmt.Println(err)
 		http.Error(w, "Failed to generate JWT token", http.StatusInternalServerError)
 		return
 	}
